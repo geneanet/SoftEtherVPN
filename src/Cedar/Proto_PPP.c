@@ -320,12 +320,12 @@ void PPPThread(THREAD *thread, void *param)
 
 		if (p->PPPStatus == PPP_STATUS_CONNECTED && authReqSent == false)
 		{
-			// EAP code
+			// PAP code
 			PPP_LCP *c = NewPPPLCP(PPP_LCP_CODE_REQ, 0);
-			USHORT eap_code = Endian16(PPP_LCP_AUTH_EAP);
+			USHORT pap_code = Endian16(PPP_LCP_AUTH_PAP);
 
-			Debug("Request EAP\n");
-			Add(c->OptionList, NewPPPOption(PPP_LCP_OPTION_AUTH, &eap_code, sizeof(eap_code)));
+			Debug("Request PAP\n");
+			Add(c->OptionList, NewPPPOption(PPP_LCP_OPTION_AUTH, &pap_code, sizeof(pap_code)));
 			if (PPPSendAndRetransmitRequest(p, PPP_PROTOCOL_LCP, c) == false)
 			{
 				PPPSetStatus(p, PPP_STATUS_FAIL);
