@@ -540,6 +540,13 @@ LIST *Win32GetNicList()
 
 		if (a->Type == 6 && a->AddressSize == 6)
 		{
+			// If the connection state of the interface is unknown, then exclude it.
+			// Unknown means that the device is not plugged into the local host.
+			if (a->MediaConnectState == MediaConnectStateUnknown)
+			{
+				continue;
+			}
+
 			NIC_ENTRY *e = ZeroMalloc(sizeof(NIC_ENTRY));
 
 			StrCpy(e->IfName, sizeof(e->IfName), a->Title);
@@ -1191,7 +1198,9 @@ void RUDPProcess_NatT_Recv(RUDP_STACK *r, UDPPACKET *udp)
 		bool is_ok = PackGetBool(p, "ok");
 		UINT64 tran_id = PackGetInt64(p, "tran_id");
 
-		ExtractAndApplyDynList(p);
+		// This ExtractAndApplyDynList() calling was removed because it is not actually used and could be abused by
+		// illegal UDP packets that spoof the source IP address. 2023-6-14 Daiyuu Nobori
+		// ExtractAndApplyDynList(p);
 
 		if (r->ServerMode)
 		{
@@ -5801,6 +5810,10 @@ SSL_PIPE *NewSslPipeEx3(bool server_mode, X *x, K *k, LIST *chain, DH_CTX *dh, b
 #endif
 
 		ssl = SSL_new(ssl_ctx);
+		if (ssl == NULL)
+		{
+			return NULL;
+		}
 
 		SSL_set_ex_data(ssl, GetSslClientCertIndex(), clientcert);
 	}
@@ -11847,6 +11860,12 @@ bool StartSSLEx3(SOCK *sock, X *x, K *priv, LIST *chain, UINT ssl_timeout, char 
 #endif
 
 		sock->ssl = SSL_new(ssl_ctx);
+
+		if (sock->ssl == NULL)
+		{
+			return false;
+		}
+
 		SSL_set_fd(sock->ssl, (int)sock->socket);
 
 #ifdef	SSL_CTRL_SET_TLSEXT_HOSTNAME
@@ -11892,6 +11911,10 @@ bool StartSSLEx3(SOCK *sock, X *x, K *priv, LIST *chain, UINT ssl_timeout, char 
 		Unlock(openssl_lock);
 	}
 
+	#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+		SSL_set1_groups_list(sock->ssl, PQ_GROUP_LIST);
+	#endif
+	
 	if (sock->ServerMode)
 	{
 //		Lock(ssl_connect_lock);
@@ -11971,7 +11994,7 @@ bool StartSSLEx3(SOCK *sock, X *x, K *priv, LIST *chain, UINT ssl_timeout, char 
 		//		Unlock(ssl_connect_lock);
 	}
 	else
-	{
+	{	
 		prev_timeout = GetTimeout(sock);
 		SetTimeout(sock, ssl_timeout);
 		// Client mode
@@ -12272,9 +12295,15 @@ UINT SecureRecv(SOCK *sock, void *data, UINT size)
 				Debug("%s %u SecureRecv() Disconnect\n", __FILE__, __LINE__);
 				return 0;
 			}
+			ERR_clear_error();
 			ret = SSL_peek(ssl, &c, sizeof(c));
 		}
 		Unlock(sock->ssl_lock);
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+		// 2021/09/10: After OpenSSL 3.x.x, both 0 and negative values might mean retryable.
+		// See: https://github.com/openssl/openssl/blob/435981cbadad2c58c35bacd30ca5d8b4c9bea72f/doc/man3/SSL_read.pod
+		// > Old documentation indicated a difference between 0 and -1, and that -1 was retryable.
+		// > You should instead call SSL_get_error() to find out if it's retryable.
 		if (ret == 0)
 		{
 			// The communication have been disconnected
@@ -12282,7 +12311,8 @@ UINT SecureRecv(SOCK *sock, void *data, UINT size)
 			Debug("%s %u SecureRecv() Disconnect\n", __FILE__, __LINE__);
 			return 0;
 		}
-		if (ret < 0)
+#endif
+		if (ret <= 0)
 		{
 			// An error has occurred
 			e = SSL_get_error(ssl, ret);
@@ -12290,14 +12320,18 @@ UINT SecureRecv(SOCK *sock, void *data, UINT size)
 			{
 				if (e == SSL_ERROR_SSL
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
-				        &&
-				        sock->ssl->s3->send_alert[0] == SSL3_AL_FATAL &&
-				        sock->ssl->s3->send_alert[0] != sock->Ssl_Init_Async_SendAlert[0] &&
-				        sock->ssl->s3->send_alert[1] != sock->Ssl_Init_Async_SendAlert[1]
+					&&
+					sock->ssl->s3->send_alert[0] == SSL3_AL_FATAL &&
+					sock->ssl->s3->send_alert[0] != sock->Ssl_Init_Async_SendAlert[0] &&
+					sock->ssl->s3->send_alert[1] != sock->Ssl_Init_Async_SendAlert[1]
 #endif
-				   )
+					)
 				{
-					Debug("%s %u SSL Fatal Error on ASYNC socket !!!\n", __FILE__, __LINE__);
+					UINT ssl_err_no;
+					while (ssl_err_no = ERR_get_error()){
+						Debug("%s %u SSL_ERROR_SSL on ASYNC socket !!! ssl_err_no = %u: '%s'\n", __FILE__, __LINE__, ssl_err_no, ERR_error_string(ssl_err_no, NULL));
+					};
+
 					Disconnect(sock);
 					return 0;
 				}
@@ -12324,14 +12358,15 @@ UINT SecureRecv(SOCK *sock, void *data, UINT size)
 		}
 #endif	// OS_UNIX
 
-// Run the time-out thread for SOLARIS
+		// Run the time-out thread for SOLARIS
 #ifdef UNIX_SOLARIS
 		ttparam = NewSocketTimeout(sock);
 #endif // UNIX_SOLARIS
 
+		ERR_clear_error();
 		ret = SSL_read(ssl, data, size);
 
-// Stop the timeout thread
+		// Stop the timeout thread
 #ifdef UNIX_SOLARIS
 		FreeSocketTimeout(ttparam);
 #endif // UNIX_SOLARIS
@@ -12344,7 +12379,11 @@ UINT SecureRecv(SOCK *sock, void *data, UINT size)
 		}
 #endif	// OS_UNIX
 
-		if (ret < 0)
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+		if (ret < 0) // OpenSSL version < 3.0.0
+#else
+		if (ret <= 0) // OpenSSL version >= 3.0.0
+#endif
 		{
 			e = SSL_get_error(ssl, ret);
 		}
@@ -12367,6 +12406,12 @@ UINT SecureRecv(SOCK *sock, void *data, UINT size)
 
 		return (UINT)ret;
 	}
+
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+	// 2021/09/10: After OpenSSL 3.x.x, both 0 and negative values might mean retryable.
+	// See: https://github.com/openssl/openssl/blob/435981cbadad2c58c35bacd30ca5d8b4c9bea72f/doc/man3/SSL_read.pod
+	// > Old documentation indicated a difference between 0 and -1, and that -1 was retryable.
+	// > You should instead call SSL_get_error() to find out if it's retryable.
 	if (ret == 0)
 	{
 		// Disconnect the communication
@@ -12374,20 +12419,26 @@ UINT SecureRecv(SOCK *sock, void *data, UINT size)
 		//Debug("%s %u SecureRecv() Disconnect\n", __FILE__, __LINE__);
 		return 0;
 	}
+#endif
+
 	if (sock->AsyncMode)
 	{
 		if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_SSL)
 		{
 			if (e == SSL_ERROR_SSL
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
-			        &&
-			        sock->ssl->s3->send_alert[0] == SSL3_AL_FATAL &&
-			        sock->ssl->s3->send_alert[0] != sock->Ssl_Init_Async_SendAlert[0] &&
-			        sock->ssl->s3->send_alert[1] != sock->Ssl_Init_Async_SendAlert[1]
+				&&
+				sock->ssl->s3->send_alert[0] == SSL3_AL_FATAL &&
+				sock->ssl->s3->send_alert[0] != sock->Ssl_Init_Async_SendAlert[0] &&
+				sock->ssl->s3->send_alert[1] != sock->Ssl_Init_Async_SendAlert[1]
 #endif
-			   )
+				)
 			{
-				Debug("%s %u SSL Fatal Error on ASYNC socket !!!\n", __FILE__, __LINE__);
+				UINT ssl_err_no;
+				while (ssl_err_no = ERR_get_error()) {
+					Debug("%s %u SSL_ERROR_SSL on ASYNC socket !!! ssl_err_no = %u: '%s'\n", __FILE__, __LINE__, ssl_err_no, ERR_error_string(ssl_err_no, NULL));
+				};
+
 				Disconnect(sock);
 				return 0;
 			}
@@ -12396,8 +12447,8 @@ UINT SecureRecv(SOCK *sock, void *data, UINT size)
 			return SOCK_LATER;
 		}
 	}
+	Debug("%s %u e=%u SecureRecv() Disconnect\n", __FILE__, __LINE__, e);
 	Disconnect(sock);
-	Debug("%s %u SecureRecv() Disconnect\n", __FILE__, __LINE__);
 	return 0;
 }
 
@@ -12424,8 +12475,13 @@ UINT SecureSend(SOCK *sock, void *data, UINT size)
 			return 0;
 		}
 
+		ERR_clear_error();
 		ret = SSL_write(ssl, data, size);
-		if (ret < 0)
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+		if (ret < 0) // OpenSSL version < 3.0.0
+#else
+		if (ret <= 0) // OpenSSL version >= 3.0.0
+#endif
 		{
 			e = SSL_get_error(ssl, ret);
 		}
@@ -12447,6 +12503,8 @@ UINT SecureSend(SOCK *sock, void *data, UINT size)
 		sock->WriteBlocked = false;
 		return (UINT)ret;
 	}
+
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 	if (ret == 0)
 	{
 		// Disconnect
@@ -12454,18 +12512,29 @@ UINT SecureSend(SOCK *sock, void *data, UINT size)
 		Disconnect(sock);
 		return 0;
 	}
+#endif
 
 	if (sock->AsyncMode)
 	{
 		// Confirmation of the error value
 		if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_SSL)
 		{
+			if (e == SSL_ERROR_SSL)
+			{
+				UINT ssl_err_no;
+				while (ssl_err_no = ERR_get_error()) {
+					Debug("%s %u SSL_ERROR_SSL on ASYNC socket !!! ssl_err_no = %u: '%s'\n", __FILE__, __LINE__, ssl_err_no, ERR_error_string(ssl_err_no, NULL));
+				};
+
+				Disconnect(sock);
+				return 0;
+			}
+
 			sock->WriteBlocked = true;
 			return SOCK_LATER;
 		}
-		Debug("%s %u e=%u\n", __FILE__, __LINE__, e);
 	}
-	//Debug("%s %u SecureSend() Disconnect\n", __FILE__, __LINE__);
+	Debug("%s %u e=%u SecureSend() Disconnect\n", __FILE__, __LINE__, e);
 	Disconnect(sock);
 	return 0;
 }
@@ -16186,6 +16255,12 @@ UINT GetOSSecurityLevel()
 {
 	UINT security_level_new = 0, security_level_set_ssl_version = 0;
 	struct ssl_ctx_st *ctx = SSL_CTX_new(SSLv23_method());
+
+	if (ctx == NULL)
+	{
+		return security_level_new;
+	}
+
 
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
 	security_level_new = SSL_CTX_get_security_level(ctx);

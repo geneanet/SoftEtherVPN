@@ -6269,8 +6269,6 @@ SOCK *ClientConnectGetSocket(CONNECTION *c, bool additional_connect)
 					localIP = BIND_LOCALIP_NULL;	// Specify not to bind
 				}
 				else {
-					Debug("ClientConnectGetSocket(): Using client option %r and %d for binding\n"
-						, sess->ClientOption->BindLocalIP, sess->ClientOption->BindLocalPort);
 					// Nonzero address is for source IP address to bind. Zero address is for dummy not to bind.
 					if (IsZeroIP(&sess->ClientOption->BindLocalIP) == true) {
 						localIP = BIND_LOCALIP_NULL;
@@ -6278,6 +6276,8 @@ SOCK *ClientConnectGetSocket(CONNECTION *c, bool additional_connect)
 					else {
 						localIP = &sess->ClientOption->BindLocalIP;
 					}
+					Debug("ClientConnectGetSocket(): Source IP address %r and source port number %d for binding\n"
+						, &sess->ClientOption->BindLocalIP, sess->ClientOption->BindLocalPort);
 				}
 			}
 			// In the case of second and subsequent TCP/IP connections
@@ -6291,7 +6291,7 @@ SOCK *ClientConnectGetSocket(CONNECTION *c, bool additional_connect)
 			}
 			else {
 				localport = sess->ClientOption->BindLocalPort + Count(sess->Connection->CurrentNumConnection) - 1;
-				Debug("ClientConnectGetSocket(): Additional port number %u\n", localport);
+				Debug("ClientConnectGetSocket(): Additional source port number %u\n", localport);
 			}
 			// Bottom of Bind outgoing connection
 
@@ -6773,7 +6773,6 @@ PACK *PackLoginWithOpenVPNCertificate(char *hubname, char *username, X *x)
 
 	p = NewPack();
 	PackAddStr(p, "method", "login");
-	PackAddStr(p, "hubname", hubname);
 
 	if (IsEmptyStr(username))
 	{
@@ -6782,12 +6781,26 @@ PACK *PackLoginWithOpenVPNCertificate(char *hubname, char *username, X *x)
 			FreePack(p);
 			return NULL;
 		}
+
 		UniToStr(cn_username, sizeof(cn_username), x->subject_name->CommonName);
-		PackAddStr(p, "username", cn_username);
+
+		if (strchr(cn_username, '@') != NULL)
+
+		{
+			PackAddStr(p, "username", strtok(cn_username, "@"));
+			PackAddStr(p, "hubname", strtok(NULL, ""));
+		}
+		else
+		{
+			PackAddStr(p, "username", cn_username);
+			PackAddStr(p, "hubname", hubname);
+		}
+
 	}
 	else
 	{
 		PackAddStr(p, "username", username);
+		PackAddStr(p, "hubname", hubname);
 	}
 
 	PackAddInt(p, "authtype", AUTHTYPE_OPENVPN_CERT);
